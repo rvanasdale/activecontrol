@@ -1,0 +1,217 @@
+#include <Wire.h>
+#include "SparkFunMPL3115A2.h"
+#include "SparkFun_ISM330DHCX.h"
+// #include <Servo.h>  // (commented out for now)
+
+// --- Altimeter on Wire1 ---
+MPL3115A2 myPressure;
+
+// --- IMU on Wire2 ---
+SparkFun_ISM330DHCX myISM;
+sfe_ism_data_t accelData;
+sfe_ism_data_t gyroData;
+
+// Gyro sensitivity
+const float GYRO_SENS_500DPS = 0.0175;
+
+// --- Kalman variables ---
+float pitch = 0, pitchBias = 0;
+float roll  = 0, rollBias  = 0;
+
+float P_pitch[2][2] = {{0,0},{0,0}};
+float P_roll[2][2]  = {{0,0},{0,0}};
+
+// --- Kalman tuning ---
+float Q_angle = 0.05;
+float Q_bias  = 0.005;
+
+// --- CONTROL GAINS (start conservative) ---
+float Kp = 1.0;
+float Kd = 0.1;
+
+// --- Setpoints ---
+float pitch_setpoint = 0.0;
+float roll_setpoint  = 0.0;
+
+// --- Servo settings ---
+int servo_center = 1500;
+float servo_gain = 5.0;
+
+// Servo objects (commented for now)
+// Servo s1, s2, s3, s4;
+
+unsigned long lastTime;
+
+void setup() {
+  Serial.begin(115200);
+  while(!Serial);
+
+  // Altimeter
+  Wire1.begin();
+  myPressure.begin(Wire1);
+  myPressure.setModeAltimeter();
+  myPressure.setOversampleRate(7);
+  myPressure.enableEventFlags();
+
+  // IMU
+  Wire2.begin();
+  if (!myISM.begin(Wire2)) {
+    Serial.println("IMU not found!");
+    while(1);
+  }
+
+  myISM.deviceReset();
+  while(!myISM.getDeviceReset()) { delay(1); }
+
+  myISM.setDeviceConfig();
+  myISM.setBlockDataUpdate();
+  myISM.setAccelDataRate(ISM_XL_ODR_104Hz);
+  myISM.setAccelFullScale(ISM_4g);
+  myISM.setGyroDataRate(ISM_GY_ODR_104Hz);
+  myISM.setGyroFullScale(ISM_500dps);
+  myISM.setAccelFilterLP2();
+  myISM.setAccelSlopeFilter(ISM_LP_ODR_DIV_100);
+  myISM.setGyroFilterLP1();
+  myISM.setGyroLP1Bandwidth(ISM_MEDIUM);
+
+  delay(100);
+
+  // Initialize angles
+  myISM.getAccel(&accelData);
+
+  pitch = atan2(-accelData.xData,
+    sqrt(accelData.yData*accelData.yData + accelData.zData*accelData.zData)) * 180.0 / PI;
+
+  roll = atan2(accelData.yData, accelData.zData) * 180.0 / PI;
+
+  lastTime = millis();
+
+  // Attach servos (commented)
+  /*
+  s1.attach(2);
+  s2.attach(3);
+  s3.attach(4);
+  s4.attach(5);
+  */
+
+  Serial.println("Initialized!");
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+
+  if (dt <= 0 || dt > 0.1) dt = 0.02;
+
+  if (myISM.checkStatus()) {
+    myISM.getAccel(&accelData);
+    myISM.getGyro(&gyroData);
+
+    // --- Gyro (deg/sec) ---
+    float gyroX = gyroData.xData * GYRO_SENS_500DPS;
+    float gyroY = gyroData.yData * GYRO_SENS_500DPS;
+
+    // --- Accel angles ---
+    float accelPitch = atan2(-accelData.xData,
+      sqrt(accelData.yData*accelData.yData + accelData.zData*accelData.zData)) * 180.0 / PI;
+
+    float accelRoll = atan2(accelData.yData, accelData.zData) * 180.0 / PI;
+
+    // --- Accel magnitude check ---
+    float accelMag = sqrt(
+      accelData.xData * accelData.xData +
+      accelData.yData * accelData.yData +
+      accelData.zData * accelData.zData
+    );
+
+    float R_current = (abs(accelMag - 1000.0) > 100) ? 0.5 : 0.1;
+
+    // --- Kalman ---
+    pitch = kalmanUpdate(accelPitch, gyroX, pitch, pitchBias, P_pitch, dt, R_current);
+    roll  = kalmanUpdate(accelRoll,  gyroY, roll,  rollBias,  P_roll,  dt, R_current);
+
+    // =========================================================
+    // 🔥 PD CONTROL WITH RATE DAMPING
+    // =========================================================
+
+    float pitch_error = pitch_setpoint - pitch;
+    float roll_error  = roll_setpoint  - roll;
+
+    float pitch_output = Kp * pitch_error - Kd * gyroX;
+    float roll_output  = Kp * roll_error  - Kd * gyroY;
+
+    // =========================================================
+    // 🎯 SERVO MIXING (4 fins)
+    // =========================================================
+
+    int s1_cmd = servo_center + servo_gain * ( pitch_output + roll_output);
+    int s2_cmd = servo_center + servo_gain * ( pitch_output - roll_output);
+    int s3_cmd = servo_center + servo_gain * (-pitch_output + roll_output);
+    int s4_cmd = servo_center + servo_gain * (-pitch_output - roll_output);
+
+    // Clamp
+    s1_cmd = constrain(s1_cmd, 1000, 2000);
+    s2_cmd = constrain(s2_cmd, 1000, 2000);
+    s3_cmd = constrain(s3_cmd, 1000, 2000);
+    s4_cmd = constrain(s4_cmd, 1000, 2000);
+
+    // =========================================================
+    // 📤 DEBUG OUTPUT
+    // =========================================================
+
+    Serial.print("Pitch: "); Serial.print(pitch, 2);
+    Serial.print(" Roll: "); Serial.print(roll, 2);
+
+    Serial.print(" | P_out: "); Serial.print(pitch_output);
+    Serial.print(" R_out: "); Serial.print(roll_output);
+
+    Serial.print(" | S1: "); Serial.print(s1_cmd);
+    Serial.print(" S2: "); Serial.print(s2_cmd);
+    Serial.print(" S3: "); Serial.print(s3_cmd);
+    Serial.print(" S4: "); Serial.println(s4_cmd);
+
+    // =========================================================
+    // 🚫 SERVO OUTPUT (DISABLED FOR NOW)
+    // =========================================================
+
+    /*
+    s1.writeMicroseconds(s1_cmd);
+    s2.writeMicroseconds(s2_cmd);
+    s3.writeMicroseconds(s3_cmd);
+    s4.writeMicroseconds(s4_cmd);
+    */
+  }
+
+  delay(20);
+}
+
+// --- Kalman function (unchanged) ---
+float kalmanUpdate(float accelAngle, float gyroRate, float &angle, float &bias, float P[2][2], float dt, float R_measure) {
+  float rate = gyroRate - bias;
+  angle += dt * rate;
+
+  P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
+  P[0][1] -= dt * P[1][1];
+  P[1][0] -= dt * P[1][1];
+  P[1][1] += Q_bias * dt;
+
+  float S = P[0][0] + R_measure;
+  float K0 = P[0][0] / S;
+  float K1 = P[1][0] / S;
+
+  float y = accelAngle - angle;
+
+  angle += K0 * y;
+  bias  += K1 * y;
+
+  float P00 = P[0][0];
+  float P01 = P[0][1];
+
+  P[0][0] -= K0 * P00;
+  P[0][1] -= K0 * P01;
+  P[1][0] -= K1 * P00;
+  P[1][1] -= K1 * P01;
+
+  return angle;
+}
