@@ -142,13 +142,15 @@ void loop() {
     float roll_output  = Kp * roll_error  - Kd * gyroY;
 
     // =========================================================
-    // 🎯 SERVO MIXING (4 fins)
+    // SERVO MIXING (+ fin layout relative to IMU)
     // =========================================================
 
-    int s1_cmd = servo_center + servo_gain * ( pitch_output + roll_output);
-    int s2_cmd = servo_center + servo_gain * ( pitch_output - roll_output);
-    int s3_cmd = servo_center + servo_gain * (-pitch_output + roll_output);
-    int s4_cmd = servo_center + servo_gain * (-pitch_output - roll_output);
+    // s1/s3 are the pitch pair, s2/s4 are the roll pair
+    // Fin order: s1 = top, s2 = right, s3 = bottom, s4 = left
+    int s1_cmd = servo_center + servo_gain * pitch_output;
+    int s2_cmd = servo_center + servo_gain * roll_output;
+    int s3_cmd = servo_center - servo_gain * pitch_output;
+    int s4_cmd = servo_center - servo_gain * roll_output;
 
     // Clamp
     s1_cmd = constrain(s1_cmd, 1000, 2000);
